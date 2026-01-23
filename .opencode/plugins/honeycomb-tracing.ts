@@ -1,8 +1,17 @@
 /**
  * Honeycomb Distributed Tracing Plugin for OpenCode
  * 
+ * v4 - Enhanced tool error tracking via ToolStateError
+ * 
  * Sends OpenTelemetry traces to Honeycomb for visibility into
  * agent workflows, tool executions, and session lifecycle.
+ * 
+ * Features:
+ * - Session lifecycle tracking (created, idle, error)
+ * - Sub-agent trace propagation (parent-child relationships)
+ * - Tool execution spans with state transitions
+ * - Proper error detection via ToolStateError events
+ * - Token usage and cost tracking
  * 
  * Requires: HONEYCOMB_API_KEY environment variable
  */
@@ -55,8 +64,18 @@ if (HONEYCOMB_API_KEY) {
 }
 
 // Span tracking maps (include agentMode and modelId for propagating to tool spans)
-const sessionSpans = new Map<string, { span: Span; ctx: Context; agentMode?: string; modelId?: string }>()
-const toolSpans = new Map<string, { span: Span; startTime: number }>()
+const sessionSpans = new Map<string, { 
+  span: Span
+  ctx: Context
+  agentMode?: string
+  modelId?: string
+  toolErrorCount: number 
+}>()
+const toolSpans = new Map<string, { 
+  span: Span
+  startTime: number
+  lastState?: string  // Track state for transition events
+}>()
 
 // Get tracer instance
 const tracer = trace.getTracer(SERVICE_NAME, "1.0.0")
@@ -74,7 +93,7 @@ try {
 }
 
 export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
-  console.log("[honeycomb-tracing] Plugin loaded - v3 with sub-agent trace propagation")
+  console.log("[honeycomb-tracing] Plugin loaded - v4 with tool error tracking")
   
   // Early exit if no API key
   if (!HONEYCOMB_API_KEY) {
@@ -115,7 +134,7 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
         )
         
         const ctx = trace.setSpan(context.active(), span)
-        sessionSpans.set(session.id, { span, ctx, agentMode })
+        sessionSpans.set(session.id, { span, ctx, agentMode, toolErrorCount: 0 })
         
 
       }
@@ -126,6 +145,19 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
         const sessionData = sessionSpans.get(sessionID)
         
         if (sessionData) {
+          // Add final tool error count
+          sessionData.span.setAttribute("session.tool_error_count", sessionData.toolErrorCount)
+          
+          // Clean up any orphaned tool spans for this session
+          for (const [callID, toolData] of toolSpans.entries()) {
+            if (toolData.span.isRecording()) {
+              toolData.span.setAttribute("tool.orphaned", true)
+              toolData.span.setStatus({ code: SpanStatusCode.ERROR, message: "Tool span orphaned - session ended" })
+              toolData.span.end()
+              toolSpans.delete(callID)
+            }
+          }
+          
           sessionData.span.setStatus({ code: SpanStatusCode.OK })
           sessionData.span.end()
           sessionSpans.delete(sessionID)
@@ -143,6 +175,10 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
         
         if (sessionData) {
           const error = event.properties.error
+          
+          // Add final tool error count
+          sessionData.span.setAttribute("session.tool_error_count", sessionData.toolErrorCount)
+          
           sessionData.span.setStatus({
             code: SpanStatusCode.ERROR,
             message: error?.data?.message || "Unknown error",
@@ -153,10 +189,73 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
             sessionData.span.setAttribute("error.message", error.data?.message || "Unknown")
           }
           
+          // Clean up any orphaned tool spans
+          for (const [callID, toolData] of toolSpans.entries()) {
+            if (toolData.span.isRecording()) {
+              toolData.span.setAttribute("tool.orphaned", true)
+              toolData.span.setStatus({ code: SpanStatusCode.ERROR, message: "Tool span orphaned - session error" })
+              toolData.span.end()
+              toolSpans.delete(callID)
+            }
+          }
+          
           sessionData.span.end()
           sessionSpans.delete(sessionID)
           
 
+        }
+      }
+
+      // Handle message part updates - track tool state transitions and errors
+      if (event.type === "message.part.updated") {
+        const part = event.properties.part as any
+        
+        // Only handle tool parts
+        if (part.type !== "tool") return
+        
+        const toolData = toolSpans.get(part.callID)
+        if (!toolData) return
+        
+        const state = part.state
+        const previousState = toolData.lastState
+        
+        // Add span event for state transition
+        if (state.status && state.status !== previousState) {
+          toolData.span.addEvent(`tool.state.${state.status}`, {
+            "tool.previous_state": previousState || "none",
+            "tool.current_state": state.status,
+          })
+          toolData.lastState = state.status
+        }
+        
+        // Handle error state - this is the authoritative error signal
+        if (state.status === "error") {
+          const duration = Date.now() - toolData.startTime
+          
+          toolData.span.setAttribute("tool.error", true)
+          toolData.span.setAttribute("tool.error_message", state.error || "Unknown error")
+          toolData.span.setAttribute("tool.duration_ms", duration)
+          toolData.span.setAttribute("tool.final_state", "error")
+          
+          toolData.span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: state.error || "Tool execution failed",
+          })
+          
+          toolData.span.end()
+          toolSpans.delete(part.callID)
+          
+          // Increment error count on session
+          const sessionData = sessionSpans.get(part.sessionID)
+          if (sessionData) {
+            sessionData.toolErrorCount++
+          }
+        }
+        
+        // Handle completed state - but don't end span here, let tool.execute.after do it
+        // This ensures we capture the full output from the hook
+        if (state.status === "completed") {
+          toolData.span.setAttribute("tool.final_state", "completed")
         }
       }
 
@@ -194,8 +293,6 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
     },
 
     "tool.execute.before": async (input, output) => {
-
-      
       const sessionData = sessionSpans.get(input.sessionID)
       
       // Create tool span as child of session span
@@ -239,37 +336,46 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
         parentCtx
       )
       
-      toolSpans.set(input.callID, { span, startTime: Date.now() })
+      // Add initial state event
+      span.addEvent("tool.state.pending", { "tool.current_state": "pending" })
+      
+      toolSpans.set(input.callID, { span, startTime: Date.now(), lastState: "pending" })
     },
 
     "tool.execute.after": async (input, output) => {
       const toolData = toolSpans.get(input.callID)
       
-      if (toolData) {
-        const duration = Date.now() - toolData.startTime
-        
-        toolData.span.setAttribute("tool.title", output.title)
-        toolData.span.setAttribute("tool.duration_ms", duration)
-        toolData.span.setAttribute("tool.output_length", output.output?.length || 0)
-        
-        // Add metadata if present (skip large fields like 'preview' which contains file contents)
-        if (output.metadata) {
-          const skipFields = new Set(["preview", "content", "output", "result"])
-          for (const [key, value] of Object.entries(output.metadata)) {
-            if (skipFields.has(key)) continue
-            if (typeof value === "string") {
-              // Truncate long strings
-              toolData.span.setAttribute(`tool.metadata.${key}`, value.slice(0, 200))
-            } else if (typeof value === "number" || typeof value === "boolean") {
-              toolData.span.setAttribute(`tool.metadata.${key}`, value)
-            }
+      // Check if span still exists (may have been closed by error handler)
+      if (!toolData) return
+      
+      const duration = Date.now() - toolData.startTime
+      
+      toolData.span.setAttribute("tool.title", output.title)
+      toolData.span.setAttribute("tool.duration_ms", duration)
+      toolData.span.setAttribute("tool.output_length", output.output?.length || 0)
+      
+      // Add metadata if present (skip large fields like 'preview' which contains file contents)
+      if (output.metadata) {
+        const skipFields = new Set(["preview", "content", "output", "result"])
+        for (const [key, value] of Object.entries(output.metadata)) {
+          if (skipFields.has(key)) continue
+          if (typeof value === "string") {
+            // Truncate long strings
+            toolData.span.setAttribute(`tool.metadata.${key}`, value.slice(0, 200))
+          } else if (typeof value === "number" || typeof value === "boolean") {
+            toolData.span.setAttribute(`tool.metadata.${key}`, value)
           }
         }
-        
+      }
+      
+      // Only set OK status if not already set (error handler may have set error status)
+      if (toolData.span.isRecording()) {
+        toolData.span.setAttribute("tool.error", false)
         toolData.span.setStatus({ code: SpanStatusCode.OK })
         toolData.span.end()
-        toolSpans.delete(input.callID)
       }
+      
+      toolSpans.delete(input.callID)
     },
   }
 }
