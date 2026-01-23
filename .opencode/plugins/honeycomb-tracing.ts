@@ -74,6 +74,7 @@ const sessionSpans = new Map<string, {
 const toolSpans = new Map<string, { 
   span: Span
   startTime: number
+  sessionID: string  // Track which session this tool belongs to
   lastState?: string  // Track state for transition events
 }>()
 
@@ -93,7 +94,7 @@ try {
 }
 
 export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
-  console.log("[honeycomb-tracing] Plugin loaded - v4 with tool error tracking")
+  console.log("[honeycomb-tracing] Plugin loaded - v4.1 with improved agent tracking")
   
   // Early exit if no API key
   if (!HONEYCOMB_API_KEY) {
@@ -106,6 +107,7 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
       // Handle session created - start root span (or child span for sub-agents)
       if (event.type === "session.created") {
         const session = event.properties.info
+        console.log(`[honeycomb-tracing] Session created: ${session.id}, parentID: ${session.parentID || 'none'}`)
         
         // Try to extract agent mode from session if available
         const agentMode = (session as any).mode || (session as any).agentMode || undefined
@@ -114,6 +116,10 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
         const parentSessionData = session.parentID ? sessionSpans.get(session.parentID) : null
         const parentCtx = parentSessionData?.ctx || context.active()
         const isSubAgent = !!parentSessionData
+        
+        if (session.parentID && !parentSessionData) {
+          console.log(`[honeycomb-tracing] WARNING: Parent session ${session.parentID} not found in sessionSpans`)
+        }
         
         const span = tracer.startSpan(
           isSubAgent ? `subagent:${session.id.slice(0, 8)}` : `session:${session.id.slice(0, 8)}`,
@@ -135,6 +141,7 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
         
         const ctx = trace.setSpan(context.active(), span)
         sessionSpans.set(session.id, { span, ctx, agentMode, toolErrorCount: 0 })
+        console.log(`[honeycomb-tracing] Session span started, total sessions tracked: ${sessionSpans.size}`)
         
 
       }
@@ -270,10 +277,25 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
           if (message.mode) {
             sessionData.span.setAttribute("agent.mode", message.mode)
             sessionData.agentMode = message.mode  // Track for tool spans
+            
+            // Update any in-flight tool spans FOR THIS SESSION with the agent mode
+            // (they may have started before we knew the mode)
+            for (const [, toolData] of toolSpans.entries()) {
+              if (toolData.sessionID === message.sessionID && toolData.span.isRecording()) {
+                toolData.span.setAttribute("agent.name", message.mode)
+              }
+            }
           }
           if (message.modelID) {
             sessionData.span.setAttribute("model.id", message.modelID)
             sessionData.modelId = message.modelID  // Track for tool spans
+            
+            // Update any in-flight tool spans FOR THIS SESSION with the model
+            for (const [, toolData] of toolSpans.entries()) {
+              if (toolData.sessionID === message.sessionID && toolData.span.isRecording()) {
+                toolData.span.setAttribute("agent.model", message.modelID)
+              }
+            }
           }
           if (message.providerID) {
             sessionData.span.setAttribute("provider.id", message.providerID)
@@ -295,9 +317,13 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
     "tool.execute.before": async (input, output) => {
       const sessionData = sessionSpans.get(input.sessionID)
       
+      if (!sessionData) {
+        console.log(`[honeycomb-tracing] WARNING: tool.execute.before - session ${input.sessionID} not found, available sessions: ${Array.from(sessionSpans.keys()).join(', ')}`)
+      }
+      
       // Create tool span as child of session span
       const parentCtx = sessionData?.ctx || context.active()
-      const agentMode = sessionData?.agentMode || "unknown"
+      const agentMode = sessionData?.agentMode  // May be undefined initially
       
       // Smart args preview - extract description for task tool, otherwise truncate
       let argsPreview: string
@@ -309,10 +335,11 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
         argsPreview = JSON.stringify(output.args).slice(0, 200)
       }
       
+      // Use tool name as span name - agent info goes in attributes
       // For task tool, include the subagent type in the span name for clarity
       const spanName = input.tool === "task" && output.args?.subagent_type
-        ? `${agentMode}:tool:task[${output.args.subagent_type}]`
-        : `${agentMode}:tool:${input.tool}`
+        ? `tool:task[${output.args.subagent_type}]`
+        : `tool:${input.tool}`
       
       const span = tracer.startSpan(
         spanName,
@@ -321,8 +348,8 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
             "tool.name": input.tool,
             "tool.call_id": input.callID,
             "session.id": input.sessionID,
-            "agent.name": agentMode,
-            "agent.model": sessionData?.modelId || "unknown",
+            "agent.name": agentMode || "pending",  // Will be updated when message.updated fires
+            "agent.model": sessionData?.modelId || "pending",
             "git.branch": gitBranch,
             "git.commit": gitCommit,
             "tool.args_preview": argsPreview,
@@ -339,7 +366,7 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
       // Add initial state event
       span.addEvent("tool.state.pending", { "tool.current_state": "pending" })
       
-      toolSpans.set(input.callID, { span, startTime: Date.now(), lastState: "pending" })
+      toolSpans.set(input.callID, { span, startTime: Date.now(), sessionID: input.sessionID, lastState: "pending" })
     },
 
     "tool.execute.after": async (input, output) => {
