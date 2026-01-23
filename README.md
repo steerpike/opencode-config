@@ -1,175 +1,169 @@
-# OpenCode + Beads Integration Setup
+# OpenCode Configuration
 
-This directory contains a complete **AI-powered development workflow** that combines OpenCode with **Beads task management** and a **specialized agent suite** for coordinated development.
+A portable OpenCode configuration with specialized agents, custom commands, and optional integrations for Beads task management and Honeycomb tracing.
 
-## Quick Setup
+## Using This Config in Your Project
 
-1. **Install Beads** (if not already installed):
+### Prerequisites
+
+- [OpenCode](https://opencode.ai) installed
+- [Bun](https://bun.sh) installed (for plugin dependencies)
+- (Optional) [Beads CLI](https://github.com/steveyegge/beads) for task tracking
+- (Optional) `HONEYCOMB_API_KEY` environment variable for distributed tracing
+
+### Quick Start
+
+1. **Copy core files** to your project:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
-```
-
-2. **Copy configuration files** to your project:
-```bash
-# Copy OpenCode config
 cp opencode.json /path/to/your/project/
-
-# Copy AGENTS.md template
 cp AGENTS.md /path/to/your/project/
-
-# Copy custom commands
-cp -r .opencode/command /path/to/your/project/.opencode/
-cp -r .opencode/agent /path/to/your/project/.opencode/
+cp -r .opencode /path/to/your/project/
 ```
 
-3. **Initialize Beads** in your project:
+2. **Install plugin dependencies**:
+
+```bash
+cd /path/to/your/project/.opencode
+bun install
+```
+
+3. **(Optional) Initialize Beads** for task tracking:
+
 ```bash
 cd /path/to/your/project
 bd init
-bd hooks install  # Install git hooks for auto-sync
+bd hooks install  # Optional: auto-sync on git operations
 ```
 
-## Files Included
+### What's Included
 
-### `opencode.json`
-- Main OpenCode configuration with Beads integration
-- Custom commands for task management
-- Proper tool permissions and keybinds
-- Beads-specific instructions path
+| File/Directory | Purpose |
+|----------------|---------|
+| `opencode.json` | Main config: agents, commands, tools, permissions |
+| `AGENTS.md` | Instructions automatically loaded by OpenCode |
+| `.opencode/agent/` | Agent definitions (planner, builder, reviewer, debugger) |
+| `.opencode/command/` | Custom slash commands |
+| `.opencode/plugins/` | Honeycomb tracing plugin |
 
-### `AGENTS.md`
-- Complete project instructions and agent workflows
-- Technology-specific patterns (Elixir, Node.js, Go)
-- Session management guidelines
-- Agent coordination examples
+### Environment Variables
 
-### `.opencode/command/`
-- **`beads-ready.md`**: Check available tasks
-- **`beads-create.md`**: Create new tasks with proper formatting  
-- **`land-plane.md`**: Complete session end workflow
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `HONEYCOMB_API_KEY` | No | Enables distributed tracing to Honeycomb |
+| `HONEYCOMB_DATASET` | No | Dataset name (defaults to `opencode-agents`) |
 
-### `.opencode/agent/` - Specialized Agent Suite
-- **`planner.json`**: Strategy & architecture specialist
-- **`builder.json`**: Implementation & coding specialist  
-- **`reviewer.json`**: Code quality & security reviewer
-- **`debugger.json`**: Problem diagnosis & troubleshooting
-- **`beads-manager.json`**: Task tracking & workflow coordinator
+---
 
-## 🤖 Agent Suite Overview
+## Agent Suite
 
 | Agent | Role | Best For |
-|--------|------|----------|
+|-------|------|----------|
 | **planner** | Strategy & Design | New features, architecture, complex requirements |
 | **builder** | Implementation | Clear requirements, coding, testing |
 | **reviewer** | Quality Assurance | Code reviews, security checks, validation |
 | **debugger** | Troubleshooting | Bug investigation, performance issues |
-| **beads-manager** | Workflow Coordination | Task tracking, session management |
 
-## 🔄 Standard Workflows
+### Agent Commands
 
-### Feature Development
-```
-User Request → /agent planner → /agent builder → /agent reviewer → Deploy
-```
-
-### Bug Fixing  
-```
-Bug Report → /agent debugger → /agent builder → /agent reviewer → Fix
-```
-
-### Quick Tasks
-```
-Clear request → /agent builder (direct implementation)
-```
-
-## 📋 Daily Workflow
-
-### Starting a session:
 ```bash
-git pull
-/beads-ready  # or Ctrl+B
-# Select highest priority task
-
-# Complex task? Start with planner
-/agent planner "Add user authentication system"
-
-# Clear task? Go direct to builder
-/agent builder "Fix login validation bug"
+/agent planner "Design user auth system"
+/agent builder "Implement JWT middleware"
+/agent reviewer "Review auth implementation"
+/agent debugger "Login timeout issue"
 ```
 
-### During work:
+### Workflows
+
+**Feature Development:**
+```
+/agent planner → /agent builder → /agent reviewer → Deploy
+```
+
+**Bug Fix:**
+```
+/agent debugger → /agent builder → /agent reviewer → Fix
+```
+
+**Quick Task:**
+```
+/agent builder → commit → done
+```
+
+---
+
+## Beads Integration (Optional)
+
+If using Beads for task tracking:
+
+### Commands
+
 ```bash
-# Make commits with task references
+/beads-ready      # Check ready tasks
+/beads-create     # Create new task
+/beads-status     # Check all tasks
+/land-plane       # End session safely (sync + push)
+```
+
+### Task Priorities
+
+- **P0**: Critical, blocking work/production
+- **P1**: High priority, important features
+- **P2**: Medium, standard work
+- **P3**: Low, nice-to-have
+
+### Commit Format
+
+```bash
 git commit -m "feat: Add JWT middleware (bd-a1b2)"
-
-# Update task status
-bd update bd-a1b2 --status in_progress
-
-# Need review? Switch agents
-/agent reviewer "Check authentication implementation"
 ```
 
-### Ending a session:
-```bash
-/land-plane  # MANDATORY - completes full workflow
-# Ensures all work is pushed and tasks are updated
-```
+---
 
 ## Customization
 
-### Modify priorities:
-Edit the priority guidelines in `AGENTS.md` to match your team's workflow.
+### Add project-specific instructions
 
-### Add custom commands:
-Create new `.md` files in `.opencode/command/` following the existing pattern.
+Edit `opencode.json` to include your project's docs:
 
-### Update tool permissions:
-Modify the `permissions` section in `opencode.json` based on your security requirements.
+```json
+{
+  "instructions": [
+    "CONTRIBUTING.md",
+    "docs/architecture.md"
+  ]
+}
+```
 
-## 🚀 Integration Benefits
+### Add custom commands
 
-1. **Persistent memory**: Tasks survive across sessions and agents via Beads
-2. **Agent specialization**: Each AI agent focuses on their core competency
-3. **Workflow coordination**: Handoffs between agents are structured and tracked
-4. **Dependency tracking**: Blockers and relationships are managed automatically  
-5. **Git integration**: Automatic syncing and versioned task history
-6. **Multi-agent safety**: Multiple agents can work on different ready tasks safely
-7. **Quality enforcement**: Land-plane workflow ensures no work is left stranded
-8. **Context preservation**: Beads provides structured memory across agent switches
+Create `.md` files in `.opencode/command/` following existing patterns.
+
+### Modify agent permissions
+
+Edit the `agent` and `permission` sections in `opencode.json`.
+
+---
 
 ## Troubleshooting
 
-### Sync conflicts:
+### Beads sync conflicts
+
 ```bash
 git checkout --theirs .beads/issues.jsonl
 bd import -i .beads/issues.jsonl
 ```
 
-### Daemon issues:
+### Plugin not loading
+
+Ensure dependencies are installed:
 ```bash
-bd --no-daemon
+cd .opencode && bun install
 ```
 
-### Git hooks not working:
-```bash
-bd hooks install --force
-```
+---
 
-## Support
+## Links
 
-- [Beads Documentation](https://github.com/steveyegge/beads)
 - [OpenCode Documentation](https://opencode.ai/docs)
-- Create an issue in the respective repositories for bugs
-
----
-
-## 📚 Additional Documentation
-
-- **[AGENTS.md](AGENTS.md)** - Complete agent instructions, workflows, and technology patterns
-- **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** - Command cheat sheet and fast access
-- **[Commands](.opencode/command/)** - Custom commands for Beads and agent coordination
-- **[Agent Configurations](.opencode/agent/)** - Individual agent settings and permissions
-
----
-
-This setup provides a complete foundation for **AI-powered development** with specialized agents, structured task management, and coordinated multi-agent workflows.
+- [Beads Documentation](https://github.com/steveyegge/beads)

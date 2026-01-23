@@ -1,13 +1,8 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "anthropic/claude-sonnet-4-5",
   "theme": "opencode",
   "autoupdate": true,
-  "instructions": [
-    "CONTRIBUTING.md",
-    "docs/guidelines.md",
-    ".beads/beads-instructions.md"
-  ],
+  "instructions": [],
   "tools": {
     "write": true,
     "edit": true,
@@ -16,7 +11,7 @@
     "glob": true,
     "grep": true
   },
-  "commands": {
+  "command": {
     "beads-ready": {
       "template": "Check Beads for ready tasks and provide a summary of what's available to work on. Use 'bd ready --json' to get the current state of ready tasks.",
       "description": "List ready Beads tasks",
@@ -48,11 +43,6 @@
       "agent": "builder"
     }
   },
-  "keybinds": {
-    "ctrl+b": "/beads-ready",
-    "ctrl+shift+b": "/beads-create",
-    "ctrl+alt+b": "/beads-sync"
-  },
   "compaction": {
     "auto": true,
     "prune": true
@@ -63,7 +53,6 @@
   "agent": {
     "planner": {
       "description": "Strategy and design specialist for architecture and implementation planning",
-      "model": "anthropic/claude-sonnet-4-5",
       "tools": {
         "write": true,
         "edit": true,
@@ -73,14 +62,13 @@
         "bash": true
       },
       "permissions": {
-        "write": "ask",
-        "edit": "ask",
+        "write": "ask", 
+        "edit": "ask",    
         "bash": "ask"
       }
     },
     "builder": {
       "description": "Implementation specialist focused on writing high-quality code",
-      "model": "anthropic/claude-sonnet-4-5",
       "tools": {
         "write": true,
         "edit": true,
@@ -95,7 +83,6 @@
     },
     "reviewer": {
       "description": "Code quality and security specialist for reviewing code and best practices",
-      "model": "anthropic/claude-sonnet-4-5",
       "tools": {
         "read": true,
         "glob": true,
@@ -110,7 +97,6 @@
     },
     "debugger": {
       "description": "Problem diagnosis and troubleshooting specialist",
-      "model": "anthropic/claude-sonnet-4-5",
       "tools": {
         "read": true,
         "glob": true,
@@ -126,7 +112,7 @@
       }
     }
   },
-  "permissions": {
+  "permission": {
     "bash": "ask"
   }
 }
