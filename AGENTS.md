@@ -389,6 +389,84 @@ git commit -m "fix: Resolve profile page crashes (bd-g7h8)"
 /agent-coord status
 ```
 
+## 📊 Telemetry & Observability
+
+Traces are automatically sent to Honeycomb for visibility into agent workflows. The telemetry is structured around **workflow phases** rather than individual tool calls.
+
+### Span Hierarchy
+
+```
+session:main                          # Root span for the conversation
+├── phase:planning                    # Workflow phase
+│   └── agent:planner                # Agent execution
+│       (tool events with aggregated stats)
+├── phase:implementation
+│   └── agent:builder
+└── phase:review
+    └── agent:reviewer
+```
+
+### Phase Mapping
+
+Each agent type maps to a workflow phase:
+
+| Agent | Phase | Typical Position |
+|-------|-------|------------------|
+| planner | `planning` | Start of feature work |
+| builder | `implementation` | After planning |
+| reviewer | `review` | Before completion |
+| debugger | `diagnosis` | Start of bug investigation |
+| beads-manager | `coordination` | Session boundaries |
+
+### Beads Integration
+
+**Include task IDs in prompts/titles for automatic correlation:**
+
+```bash
+# Task ID will be extracted and added to spans
+/agent builder "Implement login page (bd-a1b2)"
+/agent planner "Design API for bd-c3d4"
+```
+
+Spans will include `beads.task_id` attribute, enabling:
+- Filter traces by task: `beads.task_id = "bd-a1b2"`
+- Track all work related to a specific task
+- Correlate phases within a single task
+
+### Tool Visibility
+
+Individual tool calls appear as **span events** (not separate spans) with aggregated statistics on the session/agent span:
+
+| Attribute | Description | Example |
+|-----------|-------------|---------|
+| `tools.summary` | Compact breakdown by tool type | `read:5,edit:3,bash:2` |
+| `tools.total_count` | Total tool executions | `10` |
+| `tools.error_count` | Number of failed tools | `1` |
+| `tools.errors_detail` | JSON array of all errors | `[{"tool":"bash","message":"..."}]` |
+| `tools.total_duration_ms` | Combined tool execution time | `4500` |
+
+### Debugging Errors
+
+All tool errors are preserved for debugging:
+
+1. **Span events**: Each error creates a `tool.error` event on the agent span
+2. **Aggregated attribute**: `tools.errors_detail` contains full error details as JSON
+3. **Phase visibility**: Phase spans show `tools.error_count` for quick triage
+
+**Example Honeycomb query for errors:**
+```
+WHERE tools.error_count > 0
+GROUP BY phase.name, agent.type
+```
+
+### Trace Context
+
+Traces automatically include:
+- Git branch and commit (`git.branch`, `git.commit`)
+- Session and project info
+- Token usage (input, output, cache stats)
+- Agent mode and model ID
+
 ## 📚 Additional Resources
 
 - [Beads Documentation](https://github.com/steveyegge/beads)

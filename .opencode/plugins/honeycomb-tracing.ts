@@ -1,17 +1,21 @@
 /**
  * Honeycomb Distributed Tracing Plugin for OpenCode
  * 
- * v4 - Enhanced tool error tracking via ToolStateError
+ * v8 - Phase-based telemetry structure
  * 
- * Sends OpenTelemetry traces to Honeycomb for visibility into
- * agent workflows, tool executions, and session lifecycle.
+ * Changes in v8:
+ * - MAJOR: Switched from individual tool spans to phase-based spans
+ * - Tools are now captured as span events instead of separate spans
+ * - Added tool aggregation (counts, errors) as span attributes
+ * - Added phase mapping for agent types (planner→planning, builder→implementation, etc.)
+ * - Added Beads task ID extraction from session title/prompt
+ * - Removed backward compatibility with tool spans (clean break)
  * 
- * Features:
- * - Session lifecycle tracking (created, idle, error)
- * - Sub-agent trace propagation (parent-child relationships)
- * - Tool execution spans with state transitions
- * - Proper error detection via ToolStateError events
- * - Token usage and cost tracking
+ * Span Hierarchy (NEW):
+ * - session:main (root)
+ *   - phase:{name} (planning, implementation, review, diagnosis, coordination)
+ *     - agent:{type} (planner, builder, reviewer, debugger, beads-manager)
+ *       - tool events (not spans) with aggregated statistics
  * 
  * Requires: HONEYCOMB_API_KEY environment variable
  */
@@ -28,10 +32,11 @@ import type { Plugin } from "@opencode-ai/plugin"
 const HONEYCOMB_API_KEY = process.env.HONEYCOMB_API_KEY
 const HONEYCOMB_DATASET = process.env.HONEYCOMB_DATASET || "opencode-agents"
 const SERVICE_NAME = "opencode-agents"
+const PLUGIN_VERSION = "8.0.0"
 
-// Validate API key is present
+// Validate API key is present - silent fail if not set
 if (!HONEYCOMB_API_KEY) {
-  console.warn("[honeycomb-tracing] HONEYCOMB_API_KEY not set - tracing disabled")
+  // Tracing disabled - no API key
 }
 
 // Initialize OpenTelemetry SDK with Honeycomb exporter
@@ -55,7 +60,6 @@ if (HONEYCOMB_API_KEY) {
   })
 
   sdk.start()
-  console.log(`[honeycomb-tracing] Initialized - sending traces to dataset: ${HONEYCOMB_DATASET}`)
 
   // Graceful shutdown
   const shutdown = () => sdk?.shutdown().catch(console.error)
@@ -63,25 +67,88 @@ if (HONEYCOMB_API_KEY) {
   process.on("SIGINT", shutdown)
 }
 
-// Span tracking maps (include agentMode and modelId for propagating to tool spans)
-const sessionSpans = new Map<string, { 
+// Phase mapping: agent type → workflow phase name
+const AGENT_PHASE_MAP: Record<string, string> = {
+  planner: "planning",
+  builder: "implementation",
+  reviewer: "review",
+  debugger: "diagnosis",
+  "beads-manager": "coordination",
+  general: "work",
+  explore: "exploration",
+}
+
+// Tool error tracking
+interface ToolError {
+  tool: string
+  message: string
+  timestamp: number
+  callId: string
+  sequenceNumber: number
+}
+
+// Tool execution tracking (for duration calculation)
+interface ToolExecution {
+  tool: string
+  callId: string
+  startTime: number
+  sequenceNumber: number
+  sessionID: string
+  argsPreview: string
+}
+
+// Tool aggregation data
+interface ToolAggregate {
+  counts: Record<string, number>      // { read: 5, glob: 2 }
+  errors: ToolError[]                 // All errors preserved for debugging
+  totalDurationMs: number
+  executions: number                  // Total tool executions
+}
+
+// Session tracking with phase-based structure
+interface SessionData {
   span: Span
   ctx: Context
-  agentMode?: string
-  modelId?: string
-  toolErrorCount: number 
-}>()
-const toolSpans = new Map<string, { 
-  span: Span
   startTime: number
-  sessionID: string  // Track which session this tool belongs to
-  lastState?: string  // Track state for transition events
-}>()
+  phase?: string                      // Phase name (planning, implementation, etc.)
+  agentType?: string                  // Agent type (planner, builder, etc.)
+  agentMode?: string                  // From message.mode
+  modelId?: string
+  beadsTaskId?: string                // Extracted from prompt/title
+  lastKnownAgentName?: string
+  lastKnownModelId?: string
+  toolAggregate: ToolAggregate        // Aggregated tool statistics
+  messageCount: number
+  cumulativeInputTokens: number
+  cumulativeOutputTokens: number
+}
+
+// Phase span tracking (wraps agent sessions)
+interface PhaseData {
+  span: Span
+  ctx: Context
+  startTime: number
+  phase: string
+  agentType: string
+}
+
+// Pending subagent context (from task tool to session creation)
+interface SubagentContext {
+  subagentType: string
+  parentSessionId: string
+  taskDescription: string
+  parentCtx: Context
+}
+
+const sessionSpans = new Map<string, SessionData>()
+const phaseSpans = new Map<string, PhaseData>()  // keyed by session ID
+const toolExecutions = new Map<string, ToolExecution>()  // keyed by call ID
+const pendingSubagentContext = new Map<string, SubagentContext>()
 
 // Get tracer instance
-const tracer = trace.getTracer(SERVICE_NAME, "1.0.0")
+const tracer = trace.getTracer(SERVICE_NAME, PLUGIN_VERSION)
 
-// Capture git context at startup (for enriching spans)
+// Capture git context at startup
 let gitBranch = "unknown"
 let gitCommit = "unknown"
 
@@ -93,9 +160,47 @@ try {
   // Not a git repo or git not available
 }
 
+/**
+ * Extract Beads task ID from text using regex
+ * Matches patterns like bd-a1b2, bd-xyz123, etc.
+ */
+function extractBeadsTaskId(text: string | undefined): string | undefined {
+  if (!text) return undefined
+  const match = text.match(/\bbd-[a-z0-9]+\b/i)
+  return match ? match[0].toLowerCase() : undefined
+}
+
+/**
+ * Get phase name for an agent type
+ */
+function getPhaseForAgent(agentType: string): string {
+  return AGENT_PHASE_MAP[agentType] || "work"
+}
+
+/**
+ * Create tool summary string from counts
+ * e.g., "read:5,edit:3,bash:2"
+ */
+function createToolsSummary(counts: Record<string, number>): string {
+  return Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])  // Sort by count descending
+    .map(([tool, count]) => `${tool}:${count}`)
+    .join(",")
+}
+
+/**
+ * Initialize empty tool aggregate
+ */
+function createToolAggregate(): ToolAggregate {
+  return {
+    counts: {},
+    errors: [],
+    totalDurationMs: 0,
+    executions: 0,
+  }
+}
+
 export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
-  console.log("[honeycomb-tracing] Plugin loaded - v4.1 with improved agent tracking")
-  
   // Early exit if no API key
   if (!HONEYCOMB_API_KEY) {
     return {}
@@ -103,77 +208,196 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
 
   return {
     event: async ({ event }) => {
-
-      // Handle session created - start root span (or child span for sub-agents)
+      // Handle session created - start root span or phase+agent spans for sub-agents
       if (event.type === "session.created") {
         const session = event.properties.info
-        console.log(`[honeycomb-tracing] Session created: ${session.id}, parentID: ${session.parentID || 'none'}`)
+        const isSubAgent = !!session.parentID
         
-        // Try to extract agent mode from session if available
-        const agentMode = (session as any).mode || (session as any).agentMode || undefined
+        let parentCtx = context.active()
+        let subagentType: string | undefined
+        let taskDescription: string | undefined
         
-        // Check if this is a sub-agent session with a parent
-        const parentSessionData = session.parentID ? sessionSpans.get(session.parentID) : null
-        const parentCtx = parentSessionData?.ctx || context.active()
-        const isSubAgent = !!parentSessionData
-        
-        if (session.parentID && !parentSessionData) {
-          console.log(`[honeycomb-tracing] WARNING: Parent session ${session.parentID} not found in sessionSpans`)
+        if (session.parentID) {
+          // Check parent session for context
+          const parentSessionData = sessionSpans.get(session.parentID)
+          if (parentSessionData) {
+            parentCtx = parentSessionData.ctx
+          }
+          
+          // Check for pending subagent context from task tool
+          const pending = pendingSubagentContext.get(session.parentID)
+          if (pending) {
+            subagentType = pending.subagentType
+            taskDescription = pending.taskDescription
+            if (pending.parentCtx) {
+              parentCtx = pending.parentCtx
+            }
+            pendingSubagentContext.delete(session.parentID)
+          }
         }
         
-        const span = tracer.startSpan(
-          isSubAgent ? `subagent:${session.id.slice(0, 8)}` : `session:${session.id.slice(0, 8)}`,
-          {
-            attributes: {
-              "session.id": session.id,
-              "session.title": session.title,
-              "session.parent_id": session.parentID || "none",
-              "session.is_subagent": isSubAgent,
-              "project.id": session.projectID,
-              "project.directory": session.directory,
-              "git.branch": gitBranch,
-              "git.commit": gitCommit,
-              ...(agentMode ? { "agent.mode": agentMode } : {}),
+        // Extract Beads task ID from session title or task description
+        const beadsTaskId = extractBeadsTaskId(session.title) || 
+                           extractBeadsTaskId(taskDescription)
+        
+        const now = Date.now()
+        
+        if (isSubAgent && subagentType) {
+          // Create phase span first, then agent span as child
+          const phase = getPhaseForAgent(subagentType)
+          
+          // Phase span
+          const phaseSpan = tracer.startSpan(
+            `phase:${phase}`,
+            {
+              attributes: {
+                "phase.name": phase,
+                "phase.agent_type": subagentType,
+                "session.id": session.id,
+                "session.parent_id": session.parentID,
+                "git.branch": gitBranch,
+                "git.commit": gitCommit,
+                "plugin.version": PLUGIN_VERSION,
+                ...(beadsTaskId ? { "beads.task_id": beadsTaskId } : {}),
+              },
             },
-          },
-          parentCtx  // Use parent session's context if available
-        )
-        
-        const ctx = trace.setSpan(context.active(), span)
-        sessionSpans.set(session.id, { span, ctx, agentMode, toolErrorCount: 0 })
-        console.log(`[honeycomb-tracing] Session span started, total sessions tracked: ${sessionSpans.size}`)
-        
-
+            parentCtx
+          )
+          
+          const phaseCtx = trace.setSpan(context.active(), phaseSpan)
+          
+          phaseSpans.set(session.id, {
+            span: phaseSpan,
+            ctx: phaseCtx,
+            startTime: now,
+            phase,
+            agentType: subagentType,
+          })
+          
+          // Agent span (child of phase)
+          const agentSpan = tracer.startSpan(
+            `agent:${subagentType}`,
+            {
+              attributes: {
+                "agent.type": subagentType,
+                "session.id": session.id,
+                "session.title": session.title,
+                "session.task_description": taskDescription || "",
+                "project.id": session.projectID,
+                "project.directory": session.directory,
+                ...(beadsTaskId ? { "beads.task_id": beadsTaskId } : {}),
+              },
+            },
+            phaseCtx
+          )
+          
+          const agentCtx = trace.setSpan(context.active(), agentSpan)
+          
+          sessionSpans.set(session.id, {
+            span: agentSpan,
+            ctx: agentCtx,
+            startTime: now,
+            phase,
+            agentType: subagentType,
+            beadsTaskId,
+            toolAggregate: createToolAggregate(),
+            messageCount: 0,
+            cumulativeInputTokens: 0,
+            cumulativeOutputTokens: 0,
+          })
+        } else {
+          // Main session - just create session span
+          const span = tracer.startSpan(
+            "session:main",
+            {
+              attributes: {
+                "session.id": session.id,
+                "session.title": session.title,
+                "session.is_subagent": false,
+                "project.id": session.projectID,
+                "project.directory": session.directory,
+                "git.branch": gitBranch,
+                "git.commit": gitCommit,
+                "plugin.version": PLUGIN_VERSION,
+                ...(beadsTaskId ? { "beads.task_id": beadsTaskId } : {}),
+              },
+            },
+            parentCtx
+          )
+          
+          const ctx = trace.setSpan(context.active(), span)
+          
+          sessionSpans.set(session.id, {
+            span,
+            ctx,
+            startTime: now,
+            beadsTaskId,
+            toolAggregate: createToolAggregate(),
+            messageCount: 0,
+            cumulativeInputTokens: 0,
+            cumulativeOutputTokens: 0,
+          })
+        }
       }
 
-      // Handle session idle - end root span (success)
+      // Handle session idle - end spans with aggregated tool statistics
       if (event.type === "session.idle") {
         const sessionID = event.properties.sessionID
         const sessionData = sessionSpans.get(sessionID)
         
         if (sessionData) {
-          // Add final tool error count
-          sessionData.span.setAttribute("session.tool_error_count", sessionData.toolErrorCount)
+          const duration = Date.now() - sessionData.startTime
+          const { counts, errors, totalDurationMs, executions } = sessionData.toolAggregate
           
-          // Clean up any orphaned tool spans for this session
-          for (const [callID, toolData] of toolSpans.entries()) {
-            if (toolData.span.isRecording()) {
-              toolData.span.setAttribute("tool.orphaned", true)
-              toolData.span.setStatus({ code: SpanStatusCode.ERROR, message: "Tool span orphaned - session ended" })
-              toolData.span.end()
-              toolSpans.delete(callID)
-            }
+          // Add aggregated tool statistics
+          const toolsSummary = createToolsSummary(counts)
+          const totalToolCount = Object.values(counts).reduce((a, b) => a + b, 0)
+          
+          sessionData.span.setAttributes({
+            "session.duration_ms": duration,
+            "session.success": true,
+            "session.message_count": sessionData.messageCount,
+            "session.cumulative_input_tokens": sessionData.cumulativeInputTokens,
+            "session.cumulative_output_tokens": sessionData.cumulativeOutputTokens,
+            // Tool aggregates
+            "tools.summary": toolsSummary || "none",
+            "tools.total_count": totalToolCount,
+            "tools.unique_types": Object.keys(counts).length,
+            "tools.error_count": errors.length,
+            "tools.total_duration_ms": totalDurationMs,
+            "tools.executions": executions,
+          })
+          
+          // Preserve all error details as JSON (cap at 50 to avoid size limits)
+          if (errors.length > 0) {
+            sessionData.span.setAttribute(
+              "tools.errors_detail",
+              JSON.stringify(errors.slice(0, 50))
+            )
           }
           
           sessionData.span.setStatus({ code: SpanStatusCode.OK })
           sessionData.span.end()
           sessionSpans.delete(sessionID)
           
-
+          // End phase span if exists
+          const phaseData = phaseSpans.get(sessionID)
+          if (phaseData) {
+            phaseData.span.setAttributes({
+              "phase.duration_ms": Date.now() - phaseData.startTime,
+              "phase.success": true,
+              "tools.summary": toolsSummary || "none",
+              "tools.total_count": totalToolCount,
+              "tools.error_count": errors.length,
+            })
+            phaseData.span.setStatus({ code: SpanStatusCode.OK })
+            phaseData.span.end()
+            phaseSpans.delete(sessionID)
+          }
         }
       }
 
-      // Handle session error - end root span (error)
+      // Handle session error - end spans with error status
       if (event.type === "session.error") {
         const sessionID = event.properties.sessionID
         if (!sessionID) return
@@ -182,150 +406,163 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
         
         if (sessionData) {
           const error = event.properties.error
+          const duration = Date.now() - sessionData.startTime
+          const { counts, errors, totalDurationMs, executions } = sessionData.toolAggregate
           
-          // Add final tool error count
-          sessionData.span.setAttribute("session.tool_error_count", sessionData.toolErrorCount)
+          const toolsSummary = createToolsSummary(counts)
+          const totalToolCount = Object.values(counts).reduce((a, b) => a + b, 0)
+          
+          sessionData.span.setAttributes({
+            "session.duration_ms": duration,
+            "session.success": false,
+            "session.message_count": sessionData.messageCount,
+            "session.cumulative_input_tokens": sessionData.cumulativeInputTokens,
+            "session.cumulative_output_tokens": sessionData.cumulativeOutputTokens,
+            "tools.summary": toolsSummary || "none",
+            "tools.total_count": totalToolCount,
+            "tools.unique_types": Object.keys(counts).length,
+            "tools.error_count": errors.length,
+            "tools.total_duration_ms": totalDurationMs,
+            "tools.executions": executions,
+          })
+          
+          if (errors.length > 0) {
+            sessionData.span.setAttribute(
+              "tools.errors_detail",
+              JSON.stringify(errors.slice(0, 50))
+            )
+          }
+          
+          const errorName = error?.name || "UnknownError"
+          const errorData = error?.data as { message?: string } | undefined
+          const errorMessage = errorData?.message || "Unknown error"
           
           sessionData.span.setStatus({
             code: SpanStatusCode.ERROR,
-            message: error?.data?.message || "Unknown error",
+            message: errorMessage,
           })
           
           if (error) {
-            sessionData.span.setAttribute("error.name", error.name)
-            sessionData.span.setAttribute("error.message", error.data?.message || "Unknown")
-          }
-          
-          // Clean up any orphaned tool spans
-          for (const [callID, toolData] of toolSpans.entries()) {
-            if (toolData.span.isRecording()) {
-              toolData.span.setAttribute("tool.orphaned", true)
-              toolData.span.setStatus({ code: SpanStatusCode.ERROR, message: "Tool span orphaned - session error" })
-              toolData.span.end()
-              toolSpans.delete(callID)
-            }
+            sessionData.span.setAttribute("error.name", errorName)
+            sessionData.span.setAttribute("error.message", errorMessage)
           }
           
           sessionData.span.end()
           sessionSpans.delete(sessionID)
           
-
+          // End phase span with error
+          const phaseData = phaseSpans.get(sessionID)
+          if (phaseData) {
+            phaseData.span.setAttributes({
+              "phase.duration_ms": Date.now() - phaseData.startTime,
+              "phase.success": false,
+              "tools.summary": toolsSummary || "none",
+              "tools.total_count": totalToolCount,
+              "tools.error_count": errors.length,
+            })
+            phaseData.span.setStatus({
+              code: SpanStatusCode.ERROR,
+              message: errorMessage,
+            })
+            phaseData.span.end()
+            phaseSpans.delete(sessionID)
+          }
         }
       }
 
-      // Handle message part updates - track tool state transitions and errors
+      // Handle message part updates - track tool errors via state transitions
       if (event.type === "message.part.updated") {
         const part = event.properties.part as any
         
-        // Only handle tool parts
         if (part.type !== "tool") return
         
-        const toolData = toolSpans.get(part.callID)
-        if (!toolData) return
+        const execution = toolExecutions.get(part.callID)
+        if (!execution) return
         
         const state = part.state
-        const previousState = toolData.lastState
+        const sessionData = sessionSpans.get(execution.sessionID)
         
-        // Add span event for state transition
-        if (state.status && state.status !== previousState) {
-          toolData.span.addEvent(`tool.state.${state.status}`, {
-            "tool.previous_state": previousState || "none",
-            "tool.current_state": state.status,
-          })
-          toolData.lastState = state.status
-        }
-        
-        // Handle error state - this is the authoritative error signal
-        if (state.status === "error") {
-          const duration = Date.now() - toolData.startTime
+        // Handle error state
+        if (state.status === "error" && sessionData) {
+          const errorMessage = state.error || "Unknown error"
           
-          toolData.span.setAttribute("tool.error", true)
-          toolData.span.setAttribute("tool.error_message", state.error || "Unknown error")
-          toolData.span.setAttribute("tool.duration_ms", duration)
-          toolData.span.setAttribute("tool.final_state", "error")
-          
-          toolData.span.setStatus({
-            code: SpanStatusCode.ERROR,
-            message: state.error || "Tool execution failed",
+          // Add to error aggregate
+          sessionData.toolAggregate.errors.push({
+            tool: execution.tool,
+            message: errorMessage,
+            timestamp: Date.now(),
+            callId: part.callID,
+            sequenceNumber: execution.sequenceNumber,
           })
           
-          toolData.span.end()
-          toolSpans.delete(part.callID)
+          // Add error event to session span
+          sessionData.span.addEvent("tool.error", {
+            "tool.name": execution.tool,
+            "tool.call_id": part.callID,
+            "tool.sequence_number": execution.sequenceNumber,
+            "tool.error_message": errorMessage,
+          })
           
-          // Increment error count on session
-          const sessionData = sessionSpans.get(part.sessionID)
-          if (sessionData) {
-            sessionData.toolErrorCount++
-          }
-        }
-        
-        // Handle completed state - but don't end span here, let tool.execute.after do it
-        // This ensures we capture the full output from the hook
-        if (state.status === "completed") {
-          toolData.span.setAttribute("tool.final_state", "completed")
+          // Calculate duration and add to aggregate
+          const duration = Date.now() - execution.startTime
+          sessionData.toolAggregate.totalDurationMs += duration
+          
+          // Clean up execution tracking
+          toolExecutions.delete(part.callID)
         }
       }
 
-      // Handle message updates - add token/cost info to session span
+      // Handle message updates - track tokens and agent mode
       if (event.type === "message.updated") {
         const message = event.properties.info
         if (message.role !== "assistant") return
         
         const sessionData = sessionSpans.get(message.sessionID)
         if (sessionData) {
-          // Capture agent mode immediately (don't wait for tokens)
+          sessionData.messageCount++
+          
           if (message.mode) {
             sessionData.span.setAttribute("agent.mode", message.mode)
-            sessionData.agentMode = message.mode  // Track for tool spans
-            
-            // Update any in-flight tool spans FOR THIS SESSION with the agent mode
-            // (they may have started before we knew the mode)
-            for (const [, toolData] of toolSpans.entries()) {
-              if (toolData.sessionID === message.sessionID && toolData.span.isRecording()) {
-                toolData.span.setAttribute("agent.name", message.mode)
-              }
-            }
+            sessionData.agentMode = message.mode
+            sessionData.lastKnownAgentName = message.mode
           }
+          
           if (message.modelID) {
             sessionData.span.setAttribute("model.id", message.modelID)
-            sessionData.modelId = message.modelID  // Track for tool spans
-            
-            // Update any in-flight tool spans FOR THIS SESSION with the model
-            for (const [, toolData] of toolSpans.entries()) {
-              if (toolData.sessionID === message.sessionID && toolData.span.isRecording()) {
-                toolData.span.setAttribute("agent.model", message.modelID)
-              }
-            }
+            sessionData.modelId = message.modelID
+            sessionData.lastKnownModelId = message.modelID
           }
+          
           if (message.providerID) {
             sessionData.span.setAttribute("provider.id", message.providerID)
           }
           
-          // Add token/cost info when available
           if ("tokens" in message && message.tokens) {
             sessionData.span.setAttribute("tokens.input", message.tokens.input)
             sessionData.span.setAttribute("tokens.output", message.tokens.output)
             sessionData.span.setAttribute("tokens.reasoning", message.tokens.reasoning)
             sessionData.span.setAttribute("tokens.cache.read", message.tokens.cache.read)
             sessionData.span.setAttribute("tokens.cache.write", message.tokens.cache.write)
-            sessionData.span.setAttribute("cost.usd", message.cost)
+            
+            sessionData.cumulativeInputTokens += message.tokens.input || 0
+            sessionData.cumulativeOutputTokens += message.tokens.output || 0
           }
         }
       }
     },
 
+    // Tool execution hooks - capture as events, not spans
     "tool.execute.before": async (input, output) => {
       const sessionData = sessionSpans.get(input.sessionID)
+      if (!sessionData) return
       
-      if (!sessionData) {
-        console.log(`[honeycomb-tracing] WARNING: tool.execute.before - session ${input.sessionID} not found, available sessions: ${Array.from(sessionSpans.keys()).join(', ')}`)
-      }
+      const sequenceNumber = ++sessionData.toolAggregate.executions
       
-      // Create tool span as child of session span
-      const parentCtx = sessionData?.ctx || context.active()
-      const agentMode = sessionData?.agentMode  // May be undefined initially
+      // Increment tool count
+      sessionData.toolAggregate.counts[input.tool] = 
+        (sessionData.toolAggregate.counts[input.tool] || 0) + 1
       
-      // Smart args preview - extract description for task tool, otherwise truncate
+      // Create args preview
       let argsPreview: string
       if (input.tool === "task" && output.args) {
         argsPreview = `${output.args.subagent_type}: ${output.args.description}`
@@ -335,74 +572,65 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
         argsPreview = JSON.stringify(output.args).slice(0, 200)
       }
       
-      // Use tool name as span name - agent info goes in attributes
-      // For task tool, include the subagent type in the span name for clarity
-      const spanName = input.tool === "task" && output.args?.subagent_type
-        ? `tool:task[${output.args.subagent_type}]`
-        : `tool:${input.tool}`
+      // Add tool start event to session span
+      sessionData.span.addEvent(`tool.${input.tool}.start`, {
+        "tool.name": input.tool,
+        "tool.call_id": input.callID,
+        "tool.sequence_number": sequenceNumber,
+        "tool.args_preview": argsPreview,
+        // Task-specific attributes
+        ...(input.tool === "task" && output.args ? {
+          "task.subagent_type": output.args.subagent_type,
+          "task.description": output.args.description,
+        } : {}),
+      })
       
-      const span = tracer.startSpan(
-        spanName,
-        {
-          attributes: {
-            "tool.name": input.tool,
-            "tool.call_id": input.callID,
-            "session.id": input.sessionID,
-            "agent.name": agentMode || "pending",  // Will be updated when message.updated fires
-            "agent.model": sessionData?.modelId || "pending",
-            "git.branch": gitBranch,
-            "git.commit": gitCommit,
-            "tool.args_preview": argsPreview,
-            // Task-specific attributes
-            ...(input.tool === "task" && output.args ? {
-              "task.subagent_type": output.args.subagent_type,
-              "task.description": output.args.description,
-            } : {}),
-          },
-        },
-        parentCtx
-      )
+      // Track execution for duration calculation
+      toolExecutions.set(input.callID, {
+        tool: input.tool,
+        callId: input.callID,
+        startTime: Date.now(),
+        sequenceNumber,
+        sessionID: input.sessionID,
+        argsPreview,
+      })
       
-      // Add initial state event
-      span.addEvent("tool.state.pending", { "tool.current_state": "pending" })
-      
-      toolSpans.set(input.callID, { span, startTime: Date.now(), sessionID: input.sessionID, lastState: "pending" })
+      // If this is a task tool, store context for child session
+      if (input.tool === "task" && output.args?.subagent_type && sessionData) {
+        pendingSubagentContext.set(input.sessionID, {
+          subagentType: output.args.subagent_type,
+          parentSessionId: input.sessionID,
+          taskDescription: output.args.description || "",
+          parentCtx: sessionData.ctx,
+        })
+      }
     },
 
     "tool.execute.after": async (input, output) => {
-      const toolData = toolSpans.get(input.callID)
+      const execution = toolExecutions.get(input.callID)
+      if (!execution) return
       
-      // Check if span still exists (may have been closed by error handler)
-      if (!toolData) return
-      
-      const duration = Date.now() - toolData.startTime
-      
-      toolData.span.setAttribute("tool.title", output.title)
-      toolData.span.setAttribute("tool.duration_ms", duration)
-      toolData.span.setAttribute("tool.output_length", output.output?.length || 0)
-      
-      // Add metadata if present (skip large fields like 'preview' which contains file contents)
-      if (output.metadata) {
-        const skipFields = new Set(["preview", "content", "output", "result"])
-        for (const [key, value] of Object.entries(output.metadata)) {
-          if (skipFields.has(key)) continue
-          if (typeof value === "string") {
-            // Truncate long strings
-            toolData.span.setAttribute(`tool.metadata.${key}`, value.slice(0, 200))
-          } else if (typeof value === "number" || typeof value === "boolean") {
-            toolData.span.setAttribute(`tool.metadata.${key}`, value)
-          }
-        }
+      const sessionData = sessionSpans.get(execution.sessionID)
+      if (!sessionData) {
+        toolExecutions.delete(input.callID)
+        return
       }
       
-      // Only set OK status if not already set (error handler may have set error status)
-      if (toolData.span.isRecording()) {
-        toolData.span.setAttribute("tool.error", false)
-        toolData.span.setStatus({ code: SpanStatusCode.OK })
-        toolData.span.end()
-      }
+      const duration = Date.now() - execution.startTime
+      sessionData.toolAggregate.totalDurationMs += duration
       
-      toolSpans.delete(input.callID)
+      // Add tool completion event
+      sessionData.span.addEvent(`tool.${input.tool}.end`, {
+        "tool.name": input.tool,
+        "tool.call_id": input.callID,
+        "tool.sequence_number": execution.sequenceNumber,
+        "tool.duration_ms": duration,
+        "tool.title": output.title,
+        "tool.output_length": output.output?.length || 0,
+        "tool.success": true,
+      })
+      
+      toolExecutions.delete(input.callID)
     },
   }
 }
