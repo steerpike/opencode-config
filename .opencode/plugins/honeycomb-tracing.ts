@@ -32,40 +32,13 @@ import type { Plugin } from "@opencode-ai/plugin"
 const HONEYCOMB_API_KEY = process.env.HONEYCOMB_API_KEY
 const HONEYCOMB_DATASET = process.env.HONEYCOMB_DATASET || "opencode-agents"
 const SERVICE_NAME = "opencode-agents"
-const PLUGIN_VERSION = "8.3.0"  // Enhanced debugging for trace linking investigation
+const PLUGIN_VERSION = "8.4.0"  // TTL cleanup for internal Maps
 
-// Validate API key is present - silent fail if not set
-if (!HONEYCOMB_API_KEY) {
-  // Tracing disabled - no API key
-}
-
-// Initialize OpenTelemetry SDK with Honeycomb exporter
-let sdk: NodeSDK | null = null
-
-if (HONEYCOMB_API_KEY) {
-  const exporter = new OTLPTraceExporter({
-    url: "https://api.honeycomb.io/v1/traces",
-    headers: {
-      "x-honeycomb-team": HONEYCOMB_API_KEY,
-      "x-honeycomb-dataset": HONEYCOMB_DATASET,
-    },
-  })
-
-  sdk = new NodeSDK({
-    resource: new Resource({
-      [ATTR_SERVICE_NAME]: SERVICE_NAME,
-      [ATTR_SERVICE_VERSION]: "1.0.0",
-    }),
-    spanProcessor: new BatchSpanProcessor(exporter),
-  })
-
-  sdk.start()
-
-  // Graceful shutdown
-  const shutdown = () => sdk?.shutdown().catch(console.error)
-  process.on("SIGTERM", shutdown)
-  process.on("SIGINT", shutdown)
-}
+// TTL Configuration (in milliseconds)
+const SESSION_TTL_MS = 30 * 60 * 1000      // 30 minutes - sessions can be long-running
+const TOOL_TTL_MS = 5 * 60 * 1000          // 5 minutes - tools should complete quickly
+const PENDING_CONTEXT_TTL_MS = 10 * 60 * 1000  // 10 minutes - subagent should start soon
+const CLEANUP_INTERVAL_MS = 5 * 60 * 1000  // Run cleanup every 5 minutes
 
 // Phase mapping: agent type → workflow phase name
 const AGENT_PHASE_MAP: Record<string, string> = {
@@ -139,15 +112,140 @@ interface SubagentContext {
   taskDescription: string
   parentCtx: Context
   parentSpanContext: SpanContext  // Explicit span context for trace linking
+  createdAt: number  // For TTL cleanup
 }
 
+// State tracking Maps
 const sessionSpans = new Map<string, SessionData>()
 const phaseSpans = new Map<string, PhaseData>()  // keyed by session ID
 const toolExecutions = new Map<string, ToolExecution>()  // keyed by call ID
 const pendingSubagentContext = new Map<string, SubagentContext>()
 
+// Cleanup interval reference (for shutdown)
+let cleanupInterval: ReturnType<typeof setInterval> | null = null
+
+/**
+ * TTL Cleanup function - removes stale entries from all tracking Maps
+ * This prevents memory leaks when sessions/tools don't complete cleanly
+ */
+function performTTLCleanup(): void {
+  const now = Date.now()
+  
+  // Clean up stale session spans
+  for (const [sessionId, sessionData] of sessionSpans.entries()) {
+    if (now - sessionData.startTime > SESSION_TTL_MS) {
+      // End the span with a timeout status before removing
+      sessionData.span.setAttributes({
+        "session.cleanup_reason": "ttl_expired",
+        "session.age_ms": now - sessionData.startTime,
+      })
+      sessionData.span.addEvent("cleanup.ttl_expired", {
+        "cleanup.type": "session",
+        "cleanup.age_ms": now - sessionData.startTime,
+        "cleanup.ttl_ms": SESSION_TTL_MS,
+      })
+      sessionData.span.setStatus({ code: SpanStatusCode.ERROR, message: "Session TTL expired" })
+      sessionData.span.end()
+      sessionSpans.delete(sessionId)
+    }
+  }
+  
+  // Clean up stale phase spans
+  for (const [sessionId, phaseData] of phaseSpans.entries()) {
+    if (now - phaseData.startTime > SESSION_TTL_MS) {
+      phaseData.span.setAttributes({
+        "phase.cleanup_reason": "ttl_expired",
+        "phase.age_ms": now - phaseData.startTime,
+      })
+      phaseData.span.addEvent("cleanup.ttl_expired", {
+        "cleanup.type": "phase",
+        "cleanup.age_ms": now - phaseData.startTime,
+        "cleanup.ttl_ms": SESSION_TTL_MS,
+      })
+      phaseData.span.setStatus({ code: SpanStatusCode.ERROR, message: "Phase TTL expired" })
+      phaseData.span.end()
+      phaseSpans.delete(sessionId)
+    }
+  }
+  
+  // Clean up stale tool executions
+  for (const [callId, execution] of toolExecutions.entries()) {
+    if (now - execution.startTime > TOOL_TTL_MS) {
+      // Try to add event to session span if it exists
+      const sessionData = sessionSpans.get(execution.sessionID)
+      if (sessionData) {
+        sessionData.span.addEvent("cleanup.tool_ttl_expired", {
+          "cleanup.type": "tool_execution",
+          "tool.name": execution.tool,
+          "tool.call_id": callId,
+          "cleanup.age_ms": now - execution.startTime,
+          "cleanup.ttl_ms": TOOL_TTL_MS,
+        })
+      }
+      toolExecutions.delete(callId)
+    }
+  }
+  
+  // Clean up stale pending subagent contexts
+  for (const [sessionId, pending] of pendingSubagentContext.entries()) {
+    if (now - pending.createdAt > PENDING_CONTEXT_TTL_MS) {
+      // Try to add event to parent session span if it exists
+      const parentSession = sessionSpans.get(pending.parentSessionId)
+      if (parentSession) {
+        parentSession.span.addEvent("cleanup.pending_context_ttl_expired", {
+          "cleanup.type": "pending_subagent_context",
+          "cleanup.subagent_type": pending.subagentType,
+          "cleanup.age_ms": now - pending.createdAt,
+          "cleanup.ttl_ms": PENDING_CONTEXT_TTL_MS,
+        })
+      }
+      pendingSubagentContext.delete(sessionId)
+    }
+  }
+}
+
 // Get tracer instance
 const tracer = trace.getTracer(SERVICE_NAME, PLUGIN_VERSION)
+
+// Initialize OpenTelemetry SDK with Honeycomb exporter
+let sdk: NodeSDK | null = null
+
+if (HONEYCOMB_API_KEY) {
+  const exporter = new OTLPTraceExporter({
+    url: "https://api.honeycomb.io/v1/traces",
+    headers: {
+      "x-honeycomb-team": HONEYCOMB_API_KEY,
+      "x-honeycomb-dataset": HONEYCOMB_DATASET,
+    },
+  })
+
+  sdk = new NodeSDK({
+    resource: new Resource({
+      [ATTR_SERVICE_NAME]: SERVICE_NAME,
+      [ATTR_SERVICE_VERSION]: "1.0.0",
+    }),
+    spanProcessor: new BatchSpanProcessor(exporter),
+  })
+
+  sdk.start()
+  
+  // Start TTL cleanup interval
+  cleanupInterval = setInterval(performTTLCleanup, CLEANUP_INTERVAL_MS)
+
+  // Graceful shutdown
+  const shutdown = () => {
+    // Stop cleanup interval
+    if (cleanupInterval) {
+      clearInterval(cleanupInterval)
+      cleanupInterval = null
+    }
+    // Perform one final cleanup before shutdown
+    performTTLCleanup()
+    sdk?.shutdown().catch(console.error)
+  }
+  process.on("SIGTERM", shutdown)
+  process.on("SIGINT", shutdown)
+}
 
 // Capture git context at startup
 let gitBranch = "unknown"
@@ -698,6 +796,7 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
           taskDescription: output.args.description || "",
           parentCtx: sessionData.ctx,
           parentSpanContext: spanContext,  // Store explicit span context
+          createdAt: Date.now(),  // For TTL cleanup
         })
         
         // Add debug event to track pending context creation
