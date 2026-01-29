@@ -32,7 +32,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 const HONEYCOMB_API_KEY = process.env.HONEYCOMB_API_KEY
 const HONEYCOMB_DATASET = process.env.HONEYCOMB_DATASET || "opencode-agents"
 const SERVICE_NAME = "opencode-agents"
-const PLUGIN_VERSION = "8.5.0"  // Fix missing main session span (lazy creation)
+const PLUGIN_VERSION = "8.6.0"  // Clean refactor: remove strategy pattern, simplify parent tracking
 
 // TTL Configuration (in milliseconds)
 const SESSION_TTL_MS = 30 * 60 * 1000      // 30 minutes - sessions can be long-running
@@ -455,119 +455,45 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
       // Handle session created - start root span or phase+agent spans for sub-agents
       if (event.type === "session.created") {
         const session = event.properties.info
-        
-        let parentSpan: Span | undefined
-        let parentSpanContext: SpanContext | undefined
-        let subagentType: string | undefined
-        let taskDescription: string | undefined
-        let foundParentSessionId: string | undefined
-        
-        // Debug: Capture Map state at lookup time
-        const debugInfo = {
-          sessionSpansSize: sessionSpans.size,
-          sessionSpansKeys: Array.from(sessionSpans.keys()).join(","),
-          pendingContextSize: pendingSubagentContext.size,
-          pendingContextKeys: Array.from(pendingSubagentContext.keys()).join(","),
-          strategy1_hasParentId: false,
-          strategy1_foundSessionSpan: false,
-          strategy1_foundPendingContext: false,
-          strategy2_extractedFromTitle: false,
-          strategy2_foundViaIteration: false,
-          sessionParentId: session.parentID || "",
-          sessionTitle: session.title || "",
-        }
-        
-        // Strategy 1: Use parentID if OpenCode provides it
-        if (session.parentID) {
-          debugInfo.strategy1_hasParentId = true
-          foundParentSessionId = session.parentID
-          
-          // Check parent session for span - this is the key for trace linking
-          const parentSessionData = sessionSpans.get(session.parentID)
-          if (parentSessionData) {
-            debugInfo.strategy1_foundSessionSpan = true
-            parentSpan = parentSessionData.span
-            parentSpanContext = parentSpan.spanContext()
-          }
-          
-          // Check for pending subagent context from task tool (has richer context)
-          const pending = pendingSubagentContext.get(session.parentID)
-          if (pending) {
-            debugInfo.strategy1_foundPendingContext = true
-            subagentType = pending.subagentType
-            taskDescription = pending.taskDescription
-            // Use explicit span context if available (more reliable)
-            if (pending.parentSpanContext) {
-              parentSpanContext = pending.parentSpanContext
-            }
-            pendingSubagentContext.delete(session.parentID)
-          }
-        }
-        
-        // Strategy 2: Extract subagent type from session title (fallback)
-        // OpenCode includes "@planner subagent" etc. in session titles
-        if (!subagentType) {
-          const titleType = extractSubagentTypeFromTitle(session.title)
-          if (titleType) {
-            debugInfo.strategy2_extractedFromTitle = true
-            subagentType = titleType
-            // Try to find main session to use as parent
-            for (const [sessionId, sessionData] of sessionSpans.entries()) {
-              if (!sessionData.agentType) {  // Skip other subagents, find main session
-                debugInfo.strategy2_foundViaIteration = true
-                parentSpan = sessionData.span
-                parentSpanContext = parentSpan.spanContext()
-                foundParentSessionId = sessionId
-                break
-              }
-            }
-          }
-        }
-        
-        // Strategy 3: If this is a subagent but we still don't have a parent,
-        // lazily create the main session using the parentID (if available)
-        // This handles the case where the main session was created before the plugin loaded
-        if (subagentType && !parentSpanContext) {
-          const parentIdToUse = session.parentID || mainSessionId
-          if (parentIdToUse) {
-            const mainSession = getOrCreateMainSession(
-              parentIdToUse,
-              "Main Session",
-              session.projectID,
-              session.directory
-            )
-            parentSpan = mainSession.span
-            parentSpanContext = parentSpan.spanContext()
-            foundParentSessionId = parentIdToUse
-            // Add debug info
-            ;(debugInfo as any).strategy3_lazy_created_main = true
-          }
-        }
-        
-        const isSubAgent = !!subagentType
-        
-        // Extract Beads task ID from session title or task description
-        const beadsTaskId = extractBeadsTaskId(session.title) || 
-                           extractBeadsTaskId(taskDescription)
-        
         const now = Date.now()
         
+        // Step 1: Determine if this is a subagent session
+        // Subagents are identified by: pending context from task tool, OR title containing "subagent"
+        const pendingContext = session.parentID ? pendingSubagentContext.get(session.parentID) : undefined
+        const subagentType = pendingContext?.subagentType || extractSubagentTypeFromTitle(session.title)
+        const isSubAgent = !!subagentType
+        
+        // Clean up pending context if we used it
+        if (pendingContext && session.parentID) {
+          pendingSubagentContext.delete(session.parentID)
+        }
+        
+        // Step 2: Get or create parent session for trace linking
+        // For subagents, we need a parent span to link to. If none exists, create one lazily.
+        let parentSpanContext: SpanContext | undefined
+        if (isSubAgent) {
+          const parentId = session.parentID || mainSessionId
+          if (parentId) {
+            // Get existing or lazily create the main session
+            const parentSession = getOrCreateMainSession(parentId, "Main Session", session.projectID, session.directory)
+            parentSpanContext = pendingContext?.parentSpanContext || parentSession.span.spanContext()
+          }
+        }
+        
+        // Step 3: Extract metadata
+        const beadsTaskId = extractBeadsTaskId(session.title) || extractBeadsTaskId(pendingContext?.taskDescription)
+        
+        // Step 4: Create the appropriate spans
         if (isSubAgent && subagentType) {
-          // Create phase span first, then agent span as child
+          // Subagent: create phase span + agent span
           const phase = getPhaseForAgent(subagentType)
           
-          // CRITICAL: Create a parent context from the parent span context
-          // This ensures the trace ID is inherited correctly
-          let spanParentCtx: Context
-          if (parentSpanContext && parentSpanContext.traceId) {
-            // Create a context with a remote span context - this links the traces
-            const remoteCtx = trace.setSpanContext(context.active(), parentSpanContext)
-            spanParentCtx = remoteCtx
-          } else {
-            spanParentCtx = context.active()
-          }
+          // Create context from parent span (for trace linking)
+          const parentCtx = parentSpanContext 
+            ? trace.setSpanContext(context.active(), parentSpanContext)
+            : context.active()
           
-          // Phase span - child of parent session
+          // Phase span (child of main session)
           const phaseSpan = tracer.startSpan(
             `phase:${phase}`,
             {
@@ -576,37 +502,17 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
                 "phase.agent_type": subagentType,
                 "session.id": session.id,
                 "session.is_subagent": true,
-                "session.parent_id": foundParentSessionId || session.parentID || "",
+                "session.parent_id": session.parentID || mainSessionId || "",
                 "git.branch": gitBranch,
                 "git.commit": gitCommit,
                 "plugin.version": PLUGIN_VERSION,
-                // Debug attributes - Map state at lookup time
-                "debug.session_spans_size": debugInfo.sessionSpansSize,
-                "debug.session_spans_keys": debugInfo.sessionSpansKeys || "empty",
-                "debug.pending_context_size": debugInfo.pendingContextSize,
-                "debug.pending_context_keys": debugInfo.pendingContextKeys || "empty",
-                // Debug attributes - Strategy results
-                "debug.strategy1_has_parent_id": debugInfo.strategy1_hasParentId,
-                "debug.strategy1_found_session_span": debugInfo.strategy1_foundSessionSpan,
-                "debug.strategy1_found_pending_context": debugInfo.strategy1_foundPendingContext,
-                "debug.strategy2_extracted_from_title": debugInfo.strategy2_extractedFromTitle,
-                "debug.strategy2_found_via_iteration": debugInfo.strategy2_foundViaIteration,
-                // Debug attributes - Input values
-                "debug.session_parent_id_input": debugInfo.sessionParentId,
-                "debug.session_title_input": debugInfo.sessionTitle.slice(0, 100),
-                // Debug attributes - Final state
-                "debug.had_parent_span": !!parentSpan,
-                "debug.had_parent_span_context": !!parentSpanContext,
-                "debug.parent_trace_id": parentSpanContext?.traceId || "none",
-                "debug.found_parent_session_id": foundParentSessionId || "",
                 ...(beadsTaskId ? { "beads.task_id": beadsTaskId } : {}),
               },
             },
-            spanParentCtx  // This should inherit the trace ID from parent
+            parentCtx
           )
           
-          // Create context with phase span for child spans
-          const phaseCtx = trace.setSpan(spanParentCtx, phaseSpan)
+          const phaseCtx = trace.setSpan(parentCtx, phaseSpan)
           
           phaseSpans.set(session.id, {
             span: phaseSpan,
@@ -624,18 +530,17 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
                 "agent.type": subagentType,
                 "session.id": session.id,
                 "session.is_subagent": true,
-                "session.parent_id": foundParentSessionId || session.parentID || "",
+                "session.parent_id": session.parentID || mainSessionId || "",
                 "session.title": session.title,
-                "session.task_description": taskDescription || "",
+                "session.task_description": pendingContext?.taskDescription || "",
                 "project.id": session.projectID,
                 "project.directory": session.directory,
                 ...(beadsTaskId ? { "beads.task_id": beadsTaskId } : {}),
               },
             },
-            phaseCtx  // Agent is child of phase
+            phaseCtx
           )
           
-          // Create context with agent span for tool events
           const agentCtx = trace.setSpan(phaseCtx, agentSpan)
           
           sessionSpans.set(session.id, {
@@ -651,7 +556,7 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
             cumulativeOutputTokens: 0,
           })
         } else {
-          // Main session - create root session span
+          // Main session: create root span
           const span = tracer.startSpan(
             "session:main",
             {
@@ -667,11 +572,8 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
                 ...(beadsTaskId ? { "beads.task_id": beadsTaskId } : {}),
               },
             }
-            // No parent context - this is a root span
           )
           
-          // IMPORTANT: Create a new context with this span as the active span
-          // This context will be used by child spans to inherit the trace ID
           const ctx = trace.setSpan(context.active(), span)
           
           sessionSpans.set(session.id, {
@@ -684,6 +586,9 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
             cumulativeInputTokens: 0,
             cumulativeOutputTokens: 0,
           })
+          
+          // Track this as the main session for future reference
+          mainSessionId = session.id
         }
       }
 
