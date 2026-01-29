@@ -32,7 +32,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 const HONEYCOMB_API_KEY = process.env.HONEYCOMB_API_KEY
 const HONEYCOMB_DATASET = process.env.HONEYCOMB_DATASET || "opencode-agents"
 const SERVICE_NAME = "opencode-agents"
-const PLUGIN_VERSION = "8.4.1"  // Fix orphaned phase spans on early return paths
+const PLUGIN_VERSION = "8.5.0"  // Fix missing main session span (lazy creation)
 
 // TTL Configuration (in milliseconds)
 const SESSION_TTL_MS = 30 * 60 * 1000      // 30 minutes - sessions can be long-running
@@ -282,6 +282,63 @@ function cleanupOrphanedPhaseSpan(sessionID: string, reason: string): void {
   }
 }
 
+// Track the "main" session ID (the one without a parent, i.e., the orchestrator)
+let mainSessionId: string | null = null
+
+/**
+ * Lazily create or get the main session span
+ * This handles the case where the plugin loads AFTER the main session was created,
+ * so we never received the session.created event for it.
+ */
+function getOrCreateMainSession(
+  sessionID: string,
+  sessionTitle?: string,
+  projectID?: string,
+  directory?: string
+): SessionData {
+  // Check if we already have this session
+  const existing = sessionSpans.get(sessionID)
+  if (existing) {
+    return existing
+  }
+  
+  // Create a new main session span
+  const span = tracer.startSpan(
+    "session:main",
+    {
+      attributes: {
+        "session.id": sessionID,
+        "session.title": sessionTitle || "Main Session (lazy created)",
+        "session.is_subagent": false,
+        "session.lazy_created": true,  // Flag to indicate this was created lazily
+        "project.id": projectID || "",
+        "project.directory": directory || "",
+        "git.branch": gitBranch,
+        "git.commit": gitCommit,
+        "plugin.version": PLUGIN_VERSION,
+      },
+    }
+  )
+  
+  const ctx = trace.setSpan(context.active(), span)
+  const now = Date.now()
+  
+  const sessionData: SessionData = {
+    span,
+    ctx,
+    startTime: now,
+    toolAggregate: createToolAggregate(),
+    messageCount: 0,
+    cumulativeInputTokens: 0,
+    cumulativeOutputTokens: 0,
+  }
+  
+  sessionSpans.set(sessionID, sessionData)
+  mainSessionId = sessionID
+  
+  return sessionData
+}
+
 // Get tracer instance
 const tracer = trace.getTracer(SERVICE_NAME, PLUGIN_VERSION)
 
@@ -464,6 +521,26 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
                 break
               }
             }
+          }
+        }
+        
+        // Strategy 3: If this is a subagent but we still don't have a parent,
+        // lazily create the main session using the parentID (if available)
+        // This handles the case where the main session was created before the plugin loaded
+        if (subagentType && !parentSpanContext) {
+          const parentIdToUse = session.parentID || mainSessionId
+          if (parentIdToUse) {
+            const mainSession = getOrCreateMainSession(
+              parentIdToUse,
+              "Main Session",
+              session.projectID,
+              session.directory
+            )
+            parentSpan = mainSession.span
+            parentSpanContext = parentSpan.spanContext()
+            foundParentSessionId = parentIdToUse
+            // Add debug info
+            ;(debugInfo as any).strategy3_lazy_created_main = true
           }
         }
         
@@ -806,8 +883,15 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
 
     // Tool execution hooks - capture as events, not spans
     "tool.execute.before": async (input, output) => {
-      const sessionData = sessionSpans.get(input.sessionID)
-      if (!sessionData) return
+      // Lazily create main session if we haven't seen it yet
+      // This handles the case where the plugin loaded after the main session was created
+      let sessionData = sessionSpans.get(input.sessionID)
+      if (!sessionData) {
+        // Check if this looks like a main session (not a subagent)
+        // Subagents would have been created via session.created with a title containing "subagent"
+        // Main sessions don't have that, so if we're seeing tool activity without a session, create one
+        sessionData = getOrCreateMainSession(input.sessionID)
+      }
       
       const sequenceNumber = ++sessionData.toolAggregate.executions
       
