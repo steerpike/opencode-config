@@ -1,0 +1,13 @@
+# Build artifacts
+.opencode/dist/
+node_modules/
+
+# Package lock files (local development only)
+.opencode/package-lock.json
+
+# Environment files
+.env
+.env.local
+
+# OS files
+.DS_Store
