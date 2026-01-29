@@ -32,7 +32,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 const HONEYCOMB_API_KEY = process.env.HONEYCOMB_API_KEY
 const HONEYCOMB_DATASET = process.env.HONEYCOMB_DATASET || "opencode-agents"
 const SERVICE_NAME = "opencode-agents"
-const PLUGIN_VERSION = "8.4.0"  // TTL cleanup for internal Maps
+const PLUGIN_VERSION = "8.4.1"  // Fix orphaned phase spans on early return paths
 
 // TTL Configuration (in milliseconds)
 const SESSION_TTL_MS = 30 * 60 * 1000      // 30 minutes - sessions can be long-running
@@ -201,6 +201,84 @@ function performTTLCleanup(): void {
       }
       pendingSubagentContext.delete(sessionId)
     }
+  }
+}
+
+/**
+ * Helper to clean up phase span for a session
+ * This ensures phase spans are always ended, even if the session span is missing
+ * Returns tool statistics for use by the caller, or defaults if no phase data
+ */
+interface PhaseCleanupResult {
+  toolsSummary: string
+  totalToolCount: number
+  errorCount: number
+}
+
+function cleanupPhaseSpan(
+  sessionID: string,
+  success: boolean,
+  errorMessage?: string,
+  toolStats?: { counts: Record<string, number>; errors: ToolError[] }
+): PhaseCleanupResult {
+  const phaseData = phaseSpans.get(sessionID)
+  
+  // Default stats if not provided
+  const counts = toolStats?.counts || {}
+  const errors = toolStats?.errors || []
+  const toolsSummary = createToolsSummary(counts)
+  const totalToolCount = Object.values(counts).reduce((a, b) => a + b, 0)
+  
+  if (phaseData) {
+    phaseData.span.setAttributes({
+      "phase.duration_ms": Date.now() - phaseData.startTime,
+      "phase.success": success,
+      "tools.summary": toolsSummary || "none",
+      "tools.total_count": totalToolCount,
+      "tools.error_count": errors.length,
+    })
+    
+    if (success) {
+      phaseData.span.setStatus({ code: SpanStatusCode.OK })
+    } else {
+      phaseData.span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: errorMessage || "Session ended with error",
+      })
+    }
+    
+    phaseData.span.end()
+    phaseSpans.delete(sessionID)
+  }
+  
+  return { toolsSummary, totalToolCount, errorCount: errors.length }
+}
+
+/**
+ * Helper to handle orphaned phase spans when session span is missing
+ * This can happen due to race conditions or abnormal session termination
+ */
+function cleanupOrphanedPhaseSpan(sessionID: string, reason: string): void {
+  const phaseData = phaseSpans.get(sessionID)
+  
+  if (phaseData) {
+    phaseData.span.setAttributes({
+      "phase.duration_ms": Date.now() - phaseData.startTime,
+      "phase.success": false,
+      "phase.cleanup_reason": "orphaned",
+      "phase.orphan_reason": reason,
+    })
+    phaseData.span.addEvent("cleanup.orphaned_phase_span", {
+      "cleanup.type": "orphaned_phase",
+      "cleanup.reason": reason,
+      "cleanup.session_id": sessionID,
+    })
+    phaseData.span.setStatus({
+      code: SpanStatusCode.ERROR,
+      message: `Orphaned phase span: ${reason}`,
+    })
+    phaseData.span.end()
+    phaseSpans.delete(sessionID)
   }
 }
 
@@ -541,6 +619,9 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
           const duration = Date.now() - sessionData.startTime
           const { counts, errors, totalDurationMs, executions } = sessionData.toolAggregate
           
+          // End phase span FIRST (it wraps the agent span)
+          cleanupPhaseSpan(sessionID, true, undefined, { counts, errors })
+          
           // Add aggregated tool statistics
           const toolsSummary = createToolsSummary(counts)
           const totalToolCount = Object.values(counts).reduce((a, b) => a + b, 0)
@@ -571,35 +652,34 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
           sessionData.span.setStatus({ code: SpanStatusCode.OK })
           sessionData.span.end()
           sessionSpans.delete(sessionID)
-          
-          // End phase span if exists
-          const phaseData = phaseSpans.get(sessionID)
-          if (phaseData) {
-            phaseData.span.setAttributes({
-              "phase.duration_ms": Date.now() - phaseData.startTime,
-              "phase.success": true,
-              "tools.summary": toolsSummary || "none",
-              "tools.total_count": totalToolCount,
-              "tools.error_count": errors.length,
-            })
-            phaseData.span.setStatus({ code: SpanStatusCode.OK })
-            phaseData.span.end()
-            phaseSpans.delete(sessionID)
-          }
+        } else {
+          // Session span missing but phase span might exist - clean it up
+          cleanupOrphanedPhaseSpan(sessionID, "session_span_missing_on_idle")
         }
       }
 
       // Handle session error - end spans with error status
       if (event.type === "session.error") {
         const sessionID = event.properties.sessionID
-        if (!sessionID) return
+        
+        // Don't early return - we need to clean up phase spans even if sessionID is missing
+        if (!sessionID) {
+          // Can't clean up anything without a session ID
+          return
+        }
         
         const sessionData = sessionSpans.get(sessionID)
+        const error = event.properties.error
+        const errorName = error?.name || "UnknownError"
+        const errorData = error?.data as { message?: string } | undefined
+        const errorMessage = errorData?.message || "Unknown error"
         
         if (sessionData) {
-          const error = event.properties.error
           const duration = Date.now() - sessionData.startTime
           const { counts, errors, totalDurationMs, executions } = sessionData.toolAggregate
+          
+          // End phase span FIRST (it wraps the agent span)
+          cleanupPhaseSpan(sessionID, false, errorMessage, { counts, errors })
           
           const toolsSummary = createToolsSummary(counts)
           const totalToolCount = Object.values(counts).reduce((a, b) => a + b, 0)
@@ -625,10 +705,6 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
             )
           }
           
-          const errorName = error?.name || "UnknownError"
-          const errorData = error?.data as { message?: string } | undefined
-          const errorMessage = errorData?.message || "Unknown error"
-          
           sessionData.span.setStatus({
             code: SpanStatusCode.ERROR,
             message: errorMessage,
@@ -641,24 +717,9 @@ export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
           
           sessionData.span.end()
           sessionSpans.delete(sessionID)
-          
-          // End phase span with error
-          const phaseData = phaseSpans.get(sessionID)
-          if (phaseData) {
-            phaseData.span.setAttributes({
-              "phase.duration_ms": Date.now() - phaseData.startTime,
-              "phase.success": false,
-              "tools.summary": toolsSummary || "none",
-              "tools.total_count": totalToolCount,
-              "tools.error_count": errors.length,
-            })
-            phaseData.span.setStatus({
-              code: SpanStatusCode.ERROR,
-              message: errorMessage,
-            })
-            phaseData.span.end()
-            phaseSpans.delete(sessionID)
-          }
+        } else {
+          // Session span missing but phase span might exist - clean it up
+          cleanupOrphanedPhaseSpan(sessionID, `session_span_missing_on_error: ${errorMessage}`)
         }
       }
 
