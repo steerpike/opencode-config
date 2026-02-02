@@ -1,5 +1,46 @@
 # Observability-Driven Development
 
+## Quick Start - What's Available
+
+This project has two key integrations you should use immediately:
+
+### Beads (Task Tracking)
+```bash
+bd ready                    # See prioritized work
+bd show <id>                # Get task details  
+bd update <id> --status in_progress
+bd close <id> --reason "Done"
+```
+
+### Honeycomb MCP (Observability)
+You have direct access to Honeycomb via MCP tools. Use them to query production data:
+
+| MCP Tool | Use For |
+|----------|---------|
+| `run_query` | Query sessions, errors, performance data |
+| `get_trace` | Inspect a specific trace by ID |
+| `find_columns` | Discover available attributes to query |
+| `get_workspace_context` | See available environments/datasets |
+
+**Environment:** `test`  
+**Dataset:** `opencode-agents`
+
+Example query for recent errors:
+```json
+{
+  "environment_slug": "test",
+  "dataset_slug": "opencode-agents", 
+  "query_spec": {
+    "calculations": [{"op": "COUNT"}],
+    "filters": [{"column": "tools.error_count", "op": ">", "value": 0}],
+    "breakdowns": ["name", "tool.error_message"],
+    "time_range": "24h"
+  }
+}
+```
+
+---
+
 ## Philosophy
 
 Production is the only environment that matters. Every unit of work emits one wide event with all the context needed to debug without reproduction.
@@ -30,6 +71,126 @@ This approach comes from Charity Majors and the Honeycomb school of observabilit
 2. Check for unexpected errors or latency changes
 3. The trace proves it works, not local tests
 
+## Honeycomb MCP Reference
+
+### Available Tools
+
+The Honeycomb MCP provides these tools (invoke via MCP, not bash):
+
+| Tool | Purpose | Key Parameters |
+|------|---------|----------------|
+| `run_query` | Execute queries with filters, breakdowns, aggregations | `environment_slug`, `dataset_slug`, `query_spec` |
+| `get_trace` | Retrieve all spans for a trace ID | `environment_slug`, `trace_id`, `time_range` |
+| `find_columns` | Search for columns by keyword | `environment_slug`, `input` |
+| `find_queries` | Search saved/recent queries | `environment_slug`, `input` |
+| `get_dataset` | Get schema with columns | `environment_slug`, `dataset_slug` |
+| `get_workspace_context` | List environments and datasets | (none) |
+| `run_bubbleup` | Anomaly detection on query results | `query_pk`, `selection` |
+
+### Common Queries
+
+**Find sessions with errors:**
+```json
+{
+  "environment_slug": "test",
+  "dataset_slug": "opencode-agents",
+  "query_spec": {
+    "calculations": [{"op": "COUNT"}],
+    "filters": [{"column": "session.success", "op": "=", "value": false}],
+    "breakdowns": ["name", "status_message"],
+    "time_range": "7d"
+  }
+}
+```
+
+**Session success rate by agent type:**
+```json
+{
+  "environment_slug": "test",
+  "dataset_slug": "opencode-agents",
+  "query_spec": {
+    "calculations": [{"op": "COUNT"}],
+    "breakdowns": ["agent.type", "session.success"],
+    "time_range": "7d"
+  }
+}
+```
+
+**Tool usage patterns:**
+```json
+{
+  "environment_slug": "test",
+  "dataset_slug": "opencode-agents",
+  "query_spec": {
+    "calculations": [{"op": "COUNT"}],
+    "breakdowns": ["tool.name"],
+    "time_range": "24h",
+    "limit": 20
+  }
+}
+```
+
+**Slow sessions (P95 latency):**
+```json
+{
+  "environment_slug": "test",
+  "dataset_slug": "opencode-agents",
+  "query_spec": {
+    "calculations": [{"op": "P95", "column": "duration_ms"}],
+    "breakdowns": ["name"],
+    "time_range": "7d"
+  }
+}
+```
+
+### Key Columns in opencode-agents
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `name` | string | Span name (e.g., `session:main`, `agent:planner`, `tool.read.start`) |
+| `session.success` | boolean | Whether session completed successfully |
+| `session.duration_ms` | int | Total session time |
+| `agent.type` | string | Agent type: `planner`, `builder`, `reviewer`, `debugger` |
+| `phase.name` | string | Workflow phase: `planning`, `implementation`, `review`, `diagnosis` |
+| `tool.name` | string | Tool that was executed |
+| `tool.error_message` | string | Error message if tool failed |
+| `tools.error_count` | int | Count of tool errors in session |
+| `tools.summary` | string | Compact tool breakdown (e.g., `read:5,edit:3`) |
+| `beads.task_id` | string | Associated Beads task ID |
+| `git.branch` | string | Git branch name |
+| `plugin.version` | string | Tracing plugin version |
+
+## Beads Task Tracking
+
+### Commands
+
+```bash
+bd ready              # Show prioritized work (no blockers)
+bd list               # Show all issues
+bd show <id>          # Get issue details
+bd create "title" -p 2 -t task    # Create new task
+bd update <id> --status in_progress
+bd close <id> --reason "Completed"
+bd sync               # Export and push to git
+```
+
+### Workflow
+
+1. **Start session**: Run `bd ready` to see available work
+2. **Pick a task**: Use `bd update <id> --status in_progress`
+3. **Reference in commits**: Include task ID in commit messages
+4. **Complete**: Use `bd close <id> --reason "..."` when done
+5. **End session**: Run `/land-plane` to sync everything
+
+### Priority Levels
+
+| Priority | Meaning | Use For |
+|----------|---------|---------|
+| P0 | Critical | Blocking issues, production outages |
+| P1 | High | Important features, significant bugs |
+| P2 | Medium | Standard work items |
+| P3 | Low | Nice-to-have, cleanup |
+
 ## Semantic Conventions
 
 All instrumentation follows OpenTelemetry semantic conventions. See `.opencode/docs/semantic-conventions.md` for:
@@ -46,6 +207,7 @@ opencode.json                    # Agent configs, tools, permissions, commands
   agent/                         # Specialized agent prompts (planner, builder, etc.)
   plugins/honeycomb-tracing.ts   # Telemetry instrumentation
   docs/semantic-conventions.md   # OTel attribute reference
+  prompts/orchestrator.md        # Main agent behavior
 .beads/                          # Task tracking (local, not observability-related)
 ```
 
@@ -61,32 +223,6 @@ This project uses specialized agents for different phases of work:
 | debugger | diagnosis | Something broken, need to investigate |
 
 Agent prompts live in `.opencode/agent/*.json`. Invoke with `@agent_name` or via the Task tool.
-
-## Quick Reference
-
-### Beads Commands
-```bash
-bd ready              # Show prioritized work
-bd create "title" -p 2 -t task
-bd update ID --status in_progress
-bd close ID --reason "Completed"
-bd sync               # Export and push to git
-```
-
-### Honeycomb Queries (via MCP)
-```
-# Recent errors
-error.type EXISTS
-
-# Sessions by outcome
-GROUP BY session.success
-
-# Slow operations
-session.duration_ms > 5000
-
-# Filter by task
-beads.task_id = "bd-xxx"
-```
 
 ## Commit Format
 

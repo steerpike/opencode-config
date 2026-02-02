@@ -68,6 +68,17 @@ When Beads is initialized in the project:
 - Update task status as work progresses
 - Use `/land-plane` to complete sessions properly
 
+## Honeycomb MCP Integration
+
+This project has Honeycomb MCP configured for observability queries. Use it to:
+- **Before fixing bugs**: Query for the trace that shows the problem
+- **After changes**: Verify the fix appears in production data
+- **Investigate issues**: Find patterns in errors, latency, tool usage
+
+Key MCP tools: `run_query`, `get_trace`, `find_columns`, `get_workspace_context`
+
+See AGENTS.md for environment details (`test` / `opencode-agents`) and example queries.
+
 ## Communication Style
 
 - Be direct about your decision to delegate or handle directly
