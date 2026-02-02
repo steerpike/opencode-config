@@ -17,7 +17,7 @@
  *     - agent:{type} (planner, builder, reviewer, debugger, beads-manager)
  *       - tool events (not spans) with aggregated statistics
  * 
- * Requires: HONEYCOMB_API_KEY environment variable
+ * Requires: HONEYCOMB_OPENCODE_API_KEY environment variable
  */
 
 import { NodeSDK } from "@opentelemetry/sdk-node"
@@ -29,7 +29,7 @@ import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-node"
 import type { Plugin } from "@opencode-ai/plugin"
 
 // Configuration
-const HONEYCOMB_API_KEY = process.env.HONEYCOMB_API_KEY
+const HONEYCOMB_OPENCODE_API_KEY = process.env.HONEYCOMB_OPENCODE_API_KEY
 const HONEYCOMB_DATASET = process.env.HONEYCOMB_DATASET || "opencode-agents"
 const SERVICE_NAME = "opencode-agents"
 const PLUGIN_VERSION = "8.6.0"  // Clean refactor: remove strategy pattern, simplify parent tracking
@@ -345,11 +345,11 @@ const tracer = trace.getTracer(SERVICE_NAME, PLUGIN_VERSION)
 // Initialize OpenTelemetry SDK with Honeycomb exporter
 let sdk: NodeSDK | null = null
 
-if (HONEYCOMB_API_KEY) {
+if (HONEYCOMB_OPENCODE_API_KEY) {
   const exporter = new OTLPTraceExporter({
     url: "https://api.honeycomb.io/v1/traces",
     headers: {
-      "x-honeycomb-team": HONEYCOMB_API_KEY,
+      "x-honeycomb-team": HONEYCOMB_OPENCODE_API_KEY,
       "x-honeycomb-dataset": HONEYCOMB_DATASET,
     },
   })
@@ -446,7 +446,7 @@ function createToolAggregate(): ToolAggregate {
 
 export const HoneycombTracingPlugin: Plugin = async ({ project }) => {
   // Early exit if no API key
-  if (!HONEYCOMB_API_KEY) {
+  if (!HONEYCOMB_OPENCODE_API_KEY) {
     return {}
   }
 
