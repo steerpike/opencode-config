@@ -9,7 +9,7 @@ A portable OpenCode configuration with specialized agents, custom commands, and 
 - [OpenCode](https://opencode.ai) installed
 - [Bun](https://bun.sh) installed (for plugin dependencies)
 - (Optional) [Beads CLI](https://github.com/steveyegge/beads) for task tracking
-- (Optional) `HONEYCOMB_API_KEY` environment variable for distributed tracing
+- (Optional) `HONEYCOMB_OPENCODE_API_KEY` environment variable for distributed tracing
 
 ### Quick Start
 
@@ -50,7 +50,7 @@ bd hooks install  # Optional: auto-sync on git operations
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `HONEYCOMB_API_KEY` | No | Enables distributed tracing to Honeycomb |
+| `HONEYCOMB_OPENCODE_API_KEY` | No | Enables distributed tracing to Honeycomb |
 | `HONEYCOMB_DATASET` | No | Dataset name (defaults to `opencode-agents`) |
 
 ---
